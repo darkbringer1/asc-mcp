@@ -211,6 +211,19 @@ mod tests {
     }
 
     #[test]
+    fn the_index_matches_what_is_served() {
+        // The owner CLI counts from the index; it must agree with tools/list.
+        let (s, _) = server_with(json!({ "open": [{ "select": "tier:read" }, { "select": "tier:public" }] }));
+        let now = crate::policy::now_unix();
+        let profile = s.policy.as_ref().unwrap().current();
+        let from_index = AppStoreServer::tool_index()
+            .into_iter()
+            .filter(|(n, g, t)| profile.tool_access(n, *g, *t, now).is_open())
+            .count();
+        assert_eq!(names(&s).len(), from_index + 2, "index + list_access + confirm_action");
+    }
+
+    #[test]
     fn write_tier_runs_directly() {
         let (s, _) = server_with(json!({ "open": [{ "select": "respond_to_review" }] }));
         let req = call("respond_to_review", json!({ "review_id": "1", "response_body": "Thanks" }));

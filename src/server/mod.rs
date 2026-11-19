@@ -207,10 +207,14 @@ impl AppStoreServer {
     }
 
     /// Every domain tool with its group and tier, sorted by name. Independent
-    /// of `ASC_TOOLS` and `ASC_READ_ONLY`.
+    /// of `ASC_TOOLS` and `ASC_READ_ONLY`. The generic `api_*` tools are left
+    /// out: they open per operation (`api` grants), never by name or tier.
     pub fn tool_index() -> Vec<(String, Group, Tier)> {
         let mut out = Vec::new();
         for (group, router) in Self::domain_routers() {
+            if group == Group::Generic {
+                continue;
+            }
             for name in router.map.keys() {
                 let tier = policy::tier_of(name, group, catalog::classify(name));
                 out.push((name.to_string(), group, tier));
