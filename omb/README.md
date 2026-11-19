@@ -93,10 +93,18 @@ asc-mcp profile check
   `ASC_TOOL_DISCOVERY` is ignored with a profile (it would route around the
   per-call check).
 - OMB caches each server's tool list (`~/.openmausbot/mcp-app-catalog.json`);
-  whether a newly opened tool shows up without a reconnect is not tested yet.
+  its MCP Test refreshes it, so press Test after opening or closing a tool.
 
 ## Build
 
 No Rust on the Mac host (owner rule). Build VM: `omb/lima-build.yaml`
 (`limactl start --name=asc-build omb/lima-build.yaml`), Ubuntu 24.04 ARM64
 like server `omb`. `cargo test` and `cargo build --release` there.
+
+## On server omb
+
+Installed by `OpenMausBot/install-asc-mcp.sh` (workbench repo): binary
+`/usr/local/bin/asc-mcp`, system user `ascmcp`, `/etc/asc-mcp/profiles.json`
+and `/etc/asc-mcp/env` (root:ascmcp 640), key and held calls in
+`/var/lib/asc-mcp` (ascmcp 700). OMB entries `asc-<profile>` run
+`/usr/local/bin/asc-mcp-omb <profile>`, which starts the server as `ascmcp`.
