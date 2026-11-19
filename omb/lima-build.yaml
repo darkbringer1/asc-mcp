@@ -1,0 +1,38 @@
+# Build and test VM for asc-mcp (owner rule: no builds on the Mac host).
+# limactl start --name=asc-build omb/lima-build.yaml
+minimumLimaVersion: 2.0.0
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 4GiB
+disk: 20GiB
+images:
+  - location: https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55
+mounts: []
+propagateProxyEnv: false
+ssh:
+  localPort: 0
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+containerd:
+  system: false
+  user: false
+hostResolver:
+  enabled: false
+dns:
+  - 1.1.1.1
+  - 9.9.9.9
+portForwards:
+  - guestPortRange: [1, 65535]
+    guestIP: 0.0.0.0
+    proto: any
+    ignore: true
+  - guestPortRange: [1, 65535]
+    guestIP: 127.0.0.1
+    guestIPMustBeZero: false
+    proto: any
+    ignore: true

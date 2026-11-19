@@ -119,7 +119,7 @@ impl Group {
         }
     }
 
-    fn parse(name: &str) -> Option<Group> {
+    pub(crate) fn parse(name: &str) -> Option<Group> {
         let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
         Group::ALL.into_iter().find(|g| g.as_str() == normalized)
     }

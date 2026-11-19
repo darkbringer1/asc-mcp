@@ -6,6 +6,7 @@
 //! sums those routers into the single [`ToolRouter`] stored on the struct, and
 //! `#[tool_handler(router = self.tool_router)]` dispatches off it.
 
+mod access;
 mod analytics;
 mod apps;
 mod asset_library;
@@ -32,6 +33,7 @@ mod versions;
 mod webhooks;
 mod xcode_cloud;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rmcp::{
@@ -44,6 +46,7 @@ use serde_json::Value;
 use crate::client::AscClient;
 use crate::config::Config;
 use crate::error::AscError;
+use crate::policy::{self, Access, PendingCall, PendingStore, Policy, Profile, Tier};
 use catalog::Group;
 
 /// Server instructions shown to MCP clients to orient the agent.
@@ -107,6 +110,13 @@ pub struct AppStoreServer {
     pub(crate) market: Arc<market::MarketClient>,
     tool_router: ToolRouter<AppStoreServer>,
     discovery_router: Option<ToolRouter<AppStoreServer>>,
+    /// OMB fork: the caller's profile. `None` serves every tool (upstream
+    /// behaviour); `Some` closes every tool the profile doesn't open.
+    pub(crate) policy: Option<Arc<Policy>>,
+    /// Held `release`/`danger` calls waiting for `confirm_action`.
+    pub(crate) pending: Arc<PendingStore>,
+    /// Every domain tool's group and tier, by name.
+    pub(crate) index: Arc<BTreeMap<String, (Group, Tier)>>,
 }
 
 impl AppStoreServer {
@@ -154,6 +164,195 @@ impl AppStoreServer {
             market: Arc::new(market::MarketClient::default()),
             tool_router,
             discovery_router,
+            policy: None,
+            pending: Arc::new(PendingStore::from_env()),
+            index: Arc::new(Self::tool_index().into_iter().map(|(n, g, t)| (n, (g, t))).collect()),
+        }
+    }
+
+    /// OMB fork: serve one profile. Adds `list_access` and `confirm_action`;
+    /// discovery mode is switched off because it would route around the
+    /// per-call check.
+    pub fn with_policy(mut self, policy: Policy, pending: PendingStore) -> Self {
+        if let Some(discovery) = self.discovery_router.take() {
+            tracing::warn!("ASC_TOOL_DISCOVERY is ignored when ASC_PROFILE is set");
+            self.tool_router = discovery;
+        }
+        let mut access = Self::access_router();
+        for route in access.map.values_mut() {
+            route.attr.annotations = Some(if route.attr.name == "list_access" {
+                ToolAnnotations::new()
+                    .open_world(false)
+                    .read_only(true)
+                    .destructive(false)
+                    .idempotent(true)
+            } else {
+                // Runs whatever was held: never safe to auto-approve.
+                ToolAnnotations::new()
+                    .open_world(true)
+                    .read_only(false)
+                    .destructive(true)
+                    .idempotent(false)
+            });
+        }
+        self.tool_router = self.tool_router + access;
+        tracing::info!(
+            profile = %policy.profile_name(),
+            file = %policy.path().display(),
+            "serving one profile; tools it does not open are closed"
+        );
+        self.policy = Some(Arc::new(policy));
+        self.pending = Arc::new(pending);
+        self
+    }
+
+    /// Every domain tool with its group and tier, sorted by name. Independent
+    /// of `ASC_TOOLS` and `ASC_READ_ONLY`.
+    pub fn tool_index() -> Vec<(String, Group, Tier)> {
+        let mut out = Vec::new();
+        for (group, router) in Self::domain_routers() {
+            for name in router.map.keys() {
+                let tier = policy::tier_of(name, group, catalog::classify(name));
+                out.push((name.to_string(), group, tier));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Access to one tool call under `profile`, including the API operation
+    /// for the generic tools.
+    pub(crate) fn access_for(
+        &self,
+        profile: &Profile,
+        name: &str,
+        arguments: Option<&serde_json::Map<String, Value>>,
+        now: u64,
+    ) -> Access {
+        let arg = |key: &str| {
+            arguments
+                .and_then(|a| a.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let simple = |open: bool| {
+            if open {
+                Access::Open { confirm: false, until: None }
+            } else {
+                Access::Closed
+            }
+        };
+        match name {
+            "list_access" | "confirm_action" => Access::Open { confirm: false, until: None },
+            "api_search" | "api_describe" => simple(profile.has_api(now)),
+            "api_execute" => match (arg("method"), arg("path")) {
+                (Some(method), Some(path)) => profile.api_access(&method, &path, now),
+                // Listing: shown when any operation is open.
+                _ if arguments.is_none() => simple(profile.has_api(now)),
+                _ => Access::Closed,
+            },
+            "api_list" => match arg("cursor").or_else(|| arg("path")) {
+                Some(path) => profile.api_access("GET", &path, now),
+                None if arguments.is_none() => simple(profile.has_api_method("GET", now)),
+                None => Access::Closed,
+            },
+            _ => match self.index.get(name) {
+                Some((group, tier)) => profile.tool_access(name, *group, *tier, now),
+                None => Access::Closed,
+            },
+        }
+    }
+
+    /// The tools a caller sees: all of them without a profile, else the open ones.
+    fn visible_tools(&self) -> Vec<Tool> {
+        let Some(policy) = &self.policy else {
+            return self.tools();
+        };
+        let profile = policy.current();
+        let now = policy::now_unix();
+        self.tools()
+            .into_iter()
+            .filter(|t| self.access_for(&profile, &t.name, None, now).is_open())
+            .collect()
+    }
+
+    /// Check a call against the profile. `Ok(None)` runs it, `Ok(Some(_))` is
+    /// the reply for a held call.
+    fn gate(&self, request: &CallToolRequestParams) -> Result<Option<CallToolResult>, McpError> {
+        let Some(policy) = &self.policy else {
+            return Ok(None);
+        };
+        let name: &str = &request.name;
+        let profile = policy.current();
+        let now = policy::now_unix();
+        let arguments = request.arguments.as_ref();
+        match self.access_for(&profile, name, arguments, now) {
+            Access::Closed => {
+                tracing::info!(profile = %policy.profile_name(), tool = %name, "closed");
+                let what = match name {
+                    "api_execute" | "api_list" => format!(
+                        "this API operation is not open for this connection ({name})"
+                    ),
+                    _ => format!("{name} is not open for this connection"),
+                };
+                Err(McpError::invalid_params(
+                    format!("{what}. Only the owner can open it; say what you need it for."),
+                    None,
+                ))
+            }
+            Access::Open { confirm: false, .. } => {
+                tracing::info!(profile = %policy.profile_name(), tool = %name, "run");
+                Ok(None)
+            }
+            Access::Open { confirm: true, .. } => {
+                // Refuse a call that cannot run before handing out a token.
+                if let Some(tool) = self.tool_router.get(name) {
+                    let missing: Vec<&str> = tool
+                        .input_schema
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|k| !arguments.is_some_and(|a| a.contains_key(*k)))
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(McpError::invalid_params(
+                            format!("{name}: missing required argument(s) {}; nothing held", missing.join(", ")),
+                            None,
+                        ));
+                    }
+                }
+                let call = PendingCall {
+                    profile: policy.profile_name().to_string(),
+                    tool: name.to_string(),
+                    arguments: arguments.cloned(),
+                    created: now,
+                    expires: now + policy::PENDING_TTL_SECS,
+                };
+                let token = self
+                    .pending
+                    .put(&call)
+                    .map_err(|e| McpError::internal_error(e, None))?;
+                tracing::info!(profile = %policy.profile_name(), tool = %name, "held");
+                let mut preview = serde_json::to_string_pretty(&call.arguments)
+                    .unwrap_or_else(|_| "{}".into());
+                if preview.len() > 4000 {
+                    let mut cut = 4000;
+                    while !preview.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    preview.truncate(cut);
+                    preview.push_str("\n…");
+                }
+                Ok(Some(CallToolResult::success(vec![Content::text(format!(
+                    "NOT RUN YET. {name} changes what customers see or what they pay, or cannot \
+                     be undone, so it is held. Check the call below. To run it exactly as shown, \
+                     call confirm_action with token {token} within {} minutes. To change it, \
+                     call {name} again.\n\nArguments:\n{preview}",
+                    policy::PENDING_TTL_SECS / 60
+                ))])))
+            }
         }
     }
 
@@ -328,6 +527,36 @@ where
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AppStoreServer {
+    // OMB fork: these three replace the macro's versions so a profile can
+    // hide and gate tools. Without a profile they behave as upstream.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.visible_tools(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(held) = self.gate(&request)? {
+            return Ok(held);
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.visible_tools().into_iter().find(|t| t.name == name)
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())

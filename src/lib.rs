@@ -15,12 +15,16 @@
 //! - [`report`] — decoding gzipped analytics report segments.
 //! - [`json`] — trimming responses to fit an agent's context budget.
 //! - [`server`] — the tools themselves, grouped by domain.
+//! - [`policy`] — OMB fork: per-profile tool access, tiers, held calls.
+//! - [`cli`] — OMB fork: `asc-mcp tools` and `asc-mcp profile ...`.
 
 pub mod auth;
+pub mod cli;
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod json;
+pub mod policy;
 pub mod report;
 pub mod retry;
 pub mod server;
